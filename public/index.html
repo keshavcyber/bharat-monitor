@@ -1,0 +1,126 @@
+﻿<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bharat Monitor</title>
+    <link href="https://unpkg.com/maplibre-gl@5.9.0/dist/maplibre-gl.css" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="brand-block">
+        <span class="brand-mark">LIVE</span>
+        <div class="brand-copy">
+          <strong>Bharat Monitor</strong>
+          <span>India intelligence dashboard</span>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="fitIndiaBtn" class="ghost-btn">Reset Map</button>
+        <button id="refreshBtn" class="ghost-btn">Refresh</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="ticker-shell" aria-label="All India live metrics">
+        <div id="tickerStrip" class="ticker-strip"></div>
+      </section>
+
+      <section class="map-hero" aria-label="Interactive India map">
+        <aside class="hero-panel">
+          <div class="section-header">
+            <div>
+              <p class="eyebrow" id="heroEyebrow">All India</p>
+              <h2 id="heroTitle">National Intelligence Feed</h2>
+              <p id="heroDescription">India-wide news and indicators, separate from state drilldowns.</p>
+            </div>
+          </div>
+          <nav id="heroTabs" class="tabs horizontal-tabs" aria-label="Hero feed categories"></nav>
+          <div id="heroNewsList" class="news-list compact-list"></div>
+        </aside>
+        <div id="map" class="map-card"></div>
+        <div id="mapNotice" class="map-notice" hidden>MapLibre could not load. Check your connection.</div>
+      </section>
+
+      <section id="stateProfileSection" class="dashboard-section state-profile-section">
+        <div class="section-header">
+          <div>
+            <p class="eyebrow" id="profileSectionEyebrow">National Snapshot</p>
+            <h2 id="profileSectionTitle">India Overview</h2>
+            <p id="profileSectionSubtitle">Click a state on the map to open a deeper state profile.</p>
+          </div>
+        </div>
+        <div class="state-profile-card">
+          <div class="state-profile-copy">
+            <p class="state-profile-location" id="stateProfileLocation">All India</p>
+            <h3 id="stateProfileTitle">India</h3>
+            <p class="state-profile-native" id="stateProfileNative">भारत</p>
+            <p class="state-profile-tagline" id="stateProfileTagline">Union of states and the world’s largest democracy.</p>
+            <div id="stateProfileBadges" class="state-profile-badges"></div>
+            <div class="state-profile-stats">
+              <div class="state-stat">
+                <span class="state-stat-label">Population</span>
+                <strong id="stateProfilePopulation">1.43B</strong>
+                <small id="stateProfilePopulationMeta">Census baseline</small>
+              </div>
+              <div class="state-stat">
+                <span class="state-stat-label">Area</span>
+                <strong id="stateProfileArea">3,287,240</strong>
+                <small>km²</small>
+              </div>
+              <div class="state-stat">
+                <span class="state-stat-label">Literacy</span>
+                <strong id="stateProfileLiteracy">74.0%</strong>
+                <small id="stateProfileLiteracyMeta">Census baseline</small>
+              </div>
+            </div>
+            <p id="stateProfileNote" class="state-profile-note">Population and literacy values use census baseline figures for clean state-to-state comparison.</p>
+          </div>
+          <div class="state-profile-side" aria-hidden="true">
+            <div class="state-profile-side-card">
+              <span class="state-profile-side-label">Profile Code</span>
+              <strong id="stateProfileArtLabel">INDIA</strong>
+            </div>
+            <div class="state-profile-side-card state-profile-side-card-muted">
+              <span class="state-profile-side-label">View</span>
+              <strong id="stateProfileModeLabel">National</strong>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="scoreSection" class="dashboard-section score-section">
+        <div class="score-card">
+          <div class="score-topline">
+            <div class="score-head">
+              <div id="scoreGrade" class="score-grade watch">C</div>
+              <div>
+                <p class="eyebrow" id="scoreScope">All India</p>
+                <h2 id="scoreTitle">India Readiness Score</h2>
+                <div class="score-value-line">
+                  <strong id="scoreValue">--</strong>
+                  <span>/ 100</span>
+                </div>
+              </div>
+            </div>
+            <div class="score-info">
+              <button id="scoreInfoButton" class="score-info-button" type="button" aria-expanded="false" aria-controls="scoreMethod">i</button>
+              <div id="scoreMethod" class="score-method" role="tooltip">Formula and weights loading...</div>
+            </div>
+          </div>
+          <p id="scoreNote" class="score-note">Loading score modules...</p>
+          <div class="score-subhead">
+            <h3>Weighted Pillars</h3>
+            <p id="scoreUpdatedAt">Loading...</p>
+          </div>
+          <div id="scoreGrid" class="score-grid"></div>
+        </div>
+      </section>
+
+    </main>
+
+    <script src="https://unpkg.com/maplibre-gl@5.9.0/dist/maplibre-gl.js"></script>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
