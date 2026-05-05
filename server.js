@@ -9,6 +9,7 @@ const port = Number(process.env.PORT || 5173);
 const cache = new Map();
 const CACHE_MS = 10 * 60 * 1000;
 const LIVE_METRICS_CACHE_MS = 3 * 60 * 1000;
+const MAPBOX_TOKEN = process.env.MAPBOX_TOKEN || '';
 
 const BOUNDARY_URL = 'https://raw.githubusercontent.com/Subhash9325/GeoJson-Data-of-Indian-States/master/Indian_States';
 let boundaryCache = null;
@@ -1020,6 +1021,14 @@ async function serveStatic(pathname, res) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host}`);
+
+  if (url.pathname === '/api/config') {
+    sendJson(res, {
+      mapProvider: MAPBOX_TOKEN ? 'mapbox' : 'fallback',
+      mapboxToken: MAPBOX_TOKEN
+    });
+    return;
+  }
 
   if (url.pathname === '/api/categories') {
     sendJson(res, Object.entries(labels).map(([id, label]) => ({ id, label })));

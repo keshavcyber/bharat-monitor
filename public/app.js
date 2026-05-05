@@ -89,6 +89,7 @@ let map;
 let categories = [];
 let states = [];
 let boundaries = null;
+let appConfig = { mapProvider: 'fallback', mapboxToken: '' };
 let activeHeroCategory = 'top';
 let activeState = '';
 
@@ -478,7 +479,7 @@ function addBoundaryLayers() {
     if (!feature) return;
     const capital = CAPITALS[feature.properties.id];
     selectState(feature.properties.id);
-    new window.maplibregl.Popup({ closeButton: false, offset: 12 })
+    new window.mapboxgl.Popup({ closeButton: false, offset: 12 })
       .setLngLat(event.lngLat)
       .setHTML(`<strong>${escapeHtml(feature.properties.name)}</strong><br><span>${escapeHtml(feature.properties.region || 'India')}</span>${capital ? `<br><span>Capital: ${escapeHtml(capital.name)}</span>` : ''}`)
       .addTo(map);
@@ -497,16 +498,21 @@ function addBoundaryLayers() {
 }
 
 function buildMap() {
-  if (!window.maplibregl) {
-    mapNotice.textContent = 'MapLibre GL JS did not load. Check your connection.';
+  if (!window.mapboxgl) {
+    mapNotice.textContent = 'Mapbox GL JS did not load. Check your connection.';
     mapNotice.hidden = false;
     return;
   }
 
+  const hasMapboxToken = Boolean(appConfig.mapboxToken);
+  if (hasMapboxToken) {
+    window.mapboxgl.accessToken = appConfig.mapboxToken;
+  }
+
   mapNotice.hidden = true;
-  map = new window.maplibregl.Map({
+  map = new window.mapboxgl.Map({
     container: mapEl,
-    style: BLANK_INDIA_STYLE,
+    style: hasMapboxToken ? 'mapbox://styles/mapbox/dark-v11' : BLANK_INDIA_STYLE,
     center: [82.8, 22.2],
     zoom: 2.05,
     minZoom: 1.85,
@@ -518,7 +524,12 @@ function buildMap() {
     renderWorldCopies: false
   });
 
-  map.addControl(new window.maplibregl.NavigationControl({ showCompass: false }), 'bottom-right');
+  if (!hasMapboxToken) {
+    mapNotice.textContent = 'Add MAPBOX_TOKEN in Render environment variables to enable the Mapbox basemap.';
+    mapNotice.hidden = false;
+  }
+
+  map.addControl(new window.mapboxgl.NavigationControl({ showCompass: false }), 'bottom-right');
 
   map.on('load', () => {
     map.resize();
@@ -533,7 +544,8 @@ function buildMap() {
 }
 
 async function init() {
-  [categories, states] = await Promise.all([
+  [appConfig, categories, states] = await Promise.all([
+    fetchJson('/api/config'),
     fetchJson('/api/categories'),
     fetchJson('/api/states')
   ]);
