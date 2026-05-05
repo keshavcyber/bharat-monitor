@@ -61,6 +61,14 @@ Start Command: npm start
 
 The app reads Render's `PORT` environment variable automatically, so no extra port setup is needed.
 
+Add this environment variable in Render:
+
+```text
+MAPBOX_TOKEN=your_public_mapbox_token
+```
+
+Use a Mapbox public token that starts with `pk.`. Do not commit real tokens into GitHub.
+
 ## Domain
 
 Planned production domain:
