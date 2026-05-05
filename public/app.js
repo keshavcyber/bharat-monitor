@@ -497,7 +497,13 @@ function addBoundaryLayers() {
     selectState(feature.properties.id);
     new window.mapboxgl.Popup({ closeButton: false, offset: 12 })
       .setLngLat(event.lngLat)
-      .setHTML(`<strong>${escapeHtml(feature.properties.name)}</strong><br><span>${escapeHtml(feature.properties.region || 'India')}</span>${capital ? `<br><span>Capital: ${escapeHtml(capital.name)}</span>` : ''}`)
+      .setHTML(`
+        <div class="map-popup">
+          <strong>${escapeHtml(feature.properties.name)}</strong>
+          <span>${escapeHtml(feature.properties.region || 'India')}</span>
+          ${capital ? `<span>Capital: ${escapeHtml(capital.name)}</span>` : ''}
+        </div>
+      `)
       .addTo(map);
   });
 
