@@ -35,14 +35,15 @@ const scoreUpdatedAtEl = document.querySelector('#scoreUpdatedAt');
 const scoreGridEl = document.querySelector('#scoreGrid');
 const mapNotice = document.querySelector('#mapNotice');
 
-const INDIA_BOUNDS = [[66.0, 5.0], [99.8, 38.8]];
-const INDIA_RESET_PADDING = { top: 84, right: 96, bottom: 112, left: 96 };
-const INDIA_RESET_MAX_ZOOM = 2.14;
+const INDIA_BOUNDS = [[66.8, 6.0], [98.0, 37.8]];
+const INDIA_CAMERA_BOUNDS = [[66.0, 4.8], [99.3, 38.8]];
+const INDIA_RESET_PADDING = { top: 58, right: 72, bottom: 74, left: 72 };
+const INDIA_RESET_MAX_ZOOM = 2.35;
 const BLANK_INDIA_STYLE = {
   version: 8,
   sources: {},
   layers: [
-    { id: 'background', type: 'background', paint: { 'background-color': '#070b10' } }
+    { id: 'background', type: 'background', paint: { 'background-color': '#05090d' } }
   ]
 };
 
@@ -382,7 +383,22 @@ function addBoundaryLayers() {
     id: 'state-fill',
     type: 'fill',
     source: 'state-boundaries',
-    paint: { 'fill-color': '#101a24', 'fill-opacity': 0.92 }
+    paint: {
+      'fill-color': [
+        'match',
+        ['get', 'region'],
+        'South', '#102335',
+        'West', '#11283a',
+        'North', '#152239',
+        'Northwest', '#172338',
+        'Central', '#102a32',
+        'East', '#112632',
+        'Northeast', '#13293c',
+        'Islands', '#102833',
+        '#101a24'
+      ],
+      'fill-opacity': 0.96
+    }
   });
 
   map.addLayer({
@@ -512,12 +528,12 @@ function buildMap() {
   mapNotice.hidden = true;
   map = new window.mapboxgl.Map({
     container: mapEl,
-    style: hasMapboxToken ? 'mapbox://styles/mapbox/dark-v11' : BLANK_INDIA_STYLE,
+    style: BLANK_INDIA_STYLE,
     center: [82.8, 22.2],
-    zoom: 2.05,
-    minZoom: 1.85,
+    zoom: 2.2,
+    minZoom: 2.0,
     maxZoom: 7.2,
-    maxBounds: INDIA_BOUNDS,
+    maxBounds: INDIA_CAMERA_BOUNDS,
     pitch: 0,
     bearing: 0,
     attributionControl: false,
@@ -525,7 +541,7 @@ function buildMap() {
   });
 
   if (!hasMapboxToken) {
-    mapNotice.textContent = 'Add MAPBOX_TOKEN in Render environment variables to enable the Mapbox basemap.';
+    mapNotice.textContent = 'Add MAPBOX_TOKEN in Render environment variables to enable Mapbox rendering.';
     mapNotice.hidden = false;
   }
 
