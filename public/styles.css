@@ -606,6 +606,9 @@ main {
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
+  /* Never let the flex column shrink the clamp box — that slices the last
+     line mid-glyph instead of truncating with an ellipsis. */
+  flex-shrink: 0;
 }
 
 .story p {
@@ -613,9 +616,10 @@ main {
   line-height: 1.5;
   font-size: 13px;
   display: -webkit-box;
-  -webkit-line-clamp: 3;
+  -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+  flex-shrink: 0;
 }
 
 .story .story-link {
