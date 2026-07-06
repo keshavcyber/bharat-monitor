@@ -17,6 +17,7 @@
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
+    <div id="a11yStatus" class="visually-hidden" role="status" aria-live="polite"></div>
 
     <header class="site-header">
       <div class="brand-block">
@@ -43,7 +44,7 @@
 
     <main id="main">
       <section class="ticker-shell" aria-label="All India live metrics">
-        <div id="tickerStrip" class="ticker-strip"></div>
+        <div id="tickerStrip" class="ticker-strip" tabindex="0" role="group" aria-label="Live market metrics. Focus pauses the ticker."></div>
       </section>
 
       <section class="map-hero" aria-label="Interactive India map">
@@ -56,7 +57,7 @@
             </div>
           </div>
           <div id="heroTabs" class="tabs horizontal-tabs" role="tablist" aria-label="Hero feed categories"></div>
-          <div id="heroNewsList" class="news-list compact-list" role="tabpanel" aria-live="polite" aria-busy="false"></div>
+          <div id="heroNewsList" class="news-list compact-list" role="tabpanel" aria-busy="false"></div>
         </aside>
         <div id="map" class="map-card" role="region" aria-label="Map of India with clickable states. Use the state selector in the header as a keyboard alternative."></div>
         <div id="mapNotice" class="map-notice" role="status" hidden>Mapbox could not load. Check your connection.</div>
@@ -133,7 +134,7 @@
             <h3>Weighted Pillars</h3>
             <p id="scoreUpdatedAt">Loading...</p>
           </div>
-          <div id="scoreGrid" class="score-grid" aria-live="polite" aria-busy="false"></div>
+          <div id="scoreGrid" class="score-grid" aria-busy="false"></div>
         </div>
       </section>
     </main>

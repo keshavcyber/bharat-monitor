@@ -40,6 +40,7 @@ const scoreNoteEl = document.querySelector('#scoreNote');
 const scoreUpdatedAtEl = document.querySelector('#scoreUpdatedAt');
 const scoreGridEl = document.querySelector('#scoreGrid');
 const mapNotice = document.querySelector('#mapNotice');
+const a11yStatusEl = document.querySelector('#a11yStatus');
 
 const INDIA_BOUNDS = [[66.8, 6.0], [98.0, 37.8]];
 const INDIA_CAMERA_BOUNDS = [[66.0, 4.8], [99.3, 38.8]];
@@ -106,6 +107,11 @@ let lastTickerData = null;
 let scoreAnimationFrame = 0;
 
 const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+const hoverCapable = window.matchMedia('(hover: hover)');
+
+function announce(message) {
+  if (a11yStatusEl) a11yStatusEl.textContent = message;
+}
 
 // In-flight request controllers so a rapid tab/state switch can cancel the
 // previous request instead of racing it.
@@ -271,8 +277,10 @@ function emptyStateHtml(title, message, { retryable = false } = {}) {
 }
 
 function renderFeedError(message) {
+  heroListEl.setAttribute('aria-busy', 'false');
   heroListEl.innerHTML = emptyStateHtml('Could not load feed', message, { retryable: true });
   heroListEl.querySelector('.retry-btn')?.addEventListener('click', () => loadHeroFeed(activeHeroCategory));
+  announce('The news feed could not be loaded.');
 }
 
 /* --------------------------------------------------------------------------
@@ -305,7 +313,10 @@ function renderTicker(data) {
   tickerStripEl.classList.remove('is-animated');
   tickerStripEl.innerHTML = `<div class="ticker-track">${itemsHtml}</div>`;
 
-  if (prefersReducedMotion.matches) return;
+  // Marquee only where it can be paused: hover-capable pointers pause on
+  // hover, keyboards pause via the focusable strip. Touch-only devices keep
+  // the swipe-scrollable strip instead.
+  if (prefersReducedMotion.matches || !hoverCapable.matches) return;
 
   // If the strip overflows, duplicate the content and scroll it continuously.
   // Layout reads are synchronous, so this works even in a hidden tab.
@@ -313,7 +324,7 @@ function renderTicker(data) {
   if (!track) return;
   const contentWidth = track.scrollWidth;
   if (contentWidth <= tickerStripEl.clientWidth) return;
-  track.insertAdjacentHTML('beforeend', itemsHtml);
+  track.insertAdjacentHTML('beforeend', `<div style="display: contents" aria-hidden="true">${itemsHtml}</div>`);
   tickerStripEl.style.setProperty('--marquee-duration', `${Math.max(24, Math.round(contentWidth / 32))}s`);
   tickerStripEl.classList.add('is-animated');
 }
@@ -397,6 +408,7 @@ function renderScore(data) {
   scoreNoteEl.textContent = data.note;
   scoreUpdatedAtEl.textContent = `Updated ${formatTime(data.updatedAt)}`;
   scoreGridEl.setAttribute('aria-busy', 'false');
+  announce(`${data.scopeLabel} readiness score ${Number(data.score).toFixed(1)} out of 100, grade ${data.grade}.`);
   scoreGridEl.innerHTML = data.pillars.map((item, index) => `
     <article class="score-metric pillar-card" style="--i:${index}">
       <div class="score-code ${item.tone}">${escapeHtml(item.code)}</div>
@@ -439,8 +451,10 @@ function renderStories(container, data, emptyText) {
   container.setAttribute('aria-busy', 'false');
   if (!data.items.length) {
     container.innerHTML = emptyStateHtml('Nothing to show here', emptyText);
+    announce('No stories found for this view.');
     return;
   }
+  announce(`${Math.min(data.items.length, 18)} stories loaded.`);
 
   container.innerHTML = data.items.slice(0, 18).map((item, index) => `
     <article class="story" style="--i:${index}">
@@ -531,6 +545,7 @@ async function loadLiveMetrics() {
     const data = await fetchJson('/api/live-metrics');
     renderTicker(data);
   } catch (error) {
+    lastTickerData = null; // keep resize/motion listeners from resurrecting stale data
     tickerStripEl.classList.remove('is-animated');
     tickerStripEl.innerHTML = `<div class="ticker-track"><div class="ticker-item"><span class="ticker-label">Live metrics</span><span class="ticker-value">Unavailable</span><span class="ticker-delta flat">${escapeHtml(error.message)}</span></div></div>`;
   }
@@ -860,9 +875,15 @@ function buildMap(boundariesPromise) {
    Refresh
    -------------------------------------------------------------------------- */
 
+let refreshing = false;
+
 async function refreshAll() {
+  if (refreshing) return;
+  refreshing = true;
+  // aria-disabled + re-entry guard instead of .disabled, which would blur a
+  // keyboard user's focus off the button.
   refreshBtn.classList.add('is-loading');
-  refreshBtn.disabled = true;
+  refreshBtn.setAttribute('aria-disabled', 'true');
   try {
     await Promise.allSettled([
       loadHeroFeed(activeHeroCategory),
@@ -870,9 +891,11 @@ async function refreshAll() {
       loadScore(activeState),
       loadLiveMetrics()
     ]);
+    announce('Dashboard refreshed.');
   } finally {
     refreshBtn.classList.remove('is-loading');
-    refreshBtn.disabled = false;
+    refreshBtn.setAttribute('aria-disabled', 'false');
+    refreshing = false;
   }
 }
 

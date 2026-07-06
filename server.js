@@ -1006,12 +1006,20 @@ const namedEntities = {
   rdquo: '”', ldquo: '“', deg: '°', middot: '·', laquo: '«', raquo: '»'
 };
 
+function codePointOr(fallback, code) {
+  // Untrusted feeds can carry out-of-range references like &#99999999; —
+  // String.fromCodePoint throws above 0x10FFFF.
+  return Number.isInteger(code) && code >= 0 && code <= 0x10ffff
+    ? String.fromCodePoint(code)
+    : fallback;
+}
+
 function decodeEntities(value = '') {
   return value
     .replaceAll('<![CDATA[', '')
     .replaceAll(']]>', '')
-    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(Number.parseInt(code, 16)))
+    .replace(/&#(\d+);/g, (match, code) => codePointOr(match, Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (match, code) => codePointOr(match, Number.parseInt(code, 16)))
     .replace(/&([a-z]+);/gi, (match, name) => namedEntities[name.toLowerCase()] ?? match)
     .replace(/<[^>]+>/g, '')
     .replace(/\s+/g, ' ')
@@ -1028,7 +1036,6 @@ const sourceBrands = new Map([
   ['thehindu.com', 'The Hindu'],
   ['indianexpress.com', 'The Indian Express'],
   ['ndtv.com', 'NDTV'],
-  ['feedburner.com', 'NDTV'],
   ['news18.com', 'News18'],
   ['hindustantimes.com', 'Hindustan Times'],
   ['news.google.com', 'Google News'],
@@ -1044,7 +1051,13 @@ const sourceBrands = new Map([
 ]);
 
 function sourceBrandFor(sourceUrl, channelTitle) {
-  const hostname = new URL(sourceUrl).hostname.replace(/^www\./, '');
+  const url = new URL(sourceUrl);
+  const hostname = url.hostname.replace(/^www\./, '');
+  // FeedBurner hosts many publishers on one domain — disambiguate by path.
+  if (hostname.endsWith('feedburner.com')) {
+    if (url.pathname.includes('ndtv')) return 'NDTV';
+    if (url.pathname.includes('tech2')) return 'Tech2';
+  }
   if (sourceBrands.has(hostname)) return sourceBrands.get(hostname);
   const bare = hostname.split('.').slice(-2).join('.');
   if (sourceBrands.has(bare)) return sourceBrands.get(bare);
@@ -1081,6 +1094,7 @@ function parseRss(xml, sourceUrl) {
     }
 
     // Drop summaries that merely repeat the headline (common in Google News feeds).
+    const rawSummary = summary;
     if (summary && normalizedText(summary).startsWith(normalizedText(title))) summary = '';
 
     return {
@@ -1088,7 +1102,11 @@ function parseRss(xml, sourceUrl) {
       link: safeLink(tag(block, 'link')),
       source,
       publishedAt: tag(block, 'pubDate') || tag(block, 'updated'),
-      summary
+      summary,
+      // Filter-only context, stripped before the response: main matched the
+      // include-filter against the verbose channel title and full summary, so
+      // keep them available or the filter drops stories it used to keep.
+      filterContext: `${channelTitle} ${rawSummary}`
     };
   }).filter((item) => item.title && item.link);
 }
@@ -1133,7 +1151,7 @@ async function loadCategory(category, stateId) {
     })
     .filter((item) => {
       if (!profile.include.length) return true;
-      const haystack = `${item.title} ${item.summary} ${item.source}`.toLowerCase();
+      const haystack = `${item.title} ${item.summary} ${item.source} ${item.filterContext || ''}`.toLowerCase();
       return profile.include.some((term) => haystack.includes(term));
     })
     .filter((item) => {
@@ -1157,15 +1175,16 @@ async function loadCategory(category, stateId) {
   }
 
   const sourceQueues = [...bySource.values()].map((items) => items.slice(0, 6));
-  const data = [];
-  while (sourceQueues.some((items) => items.length) && data.length < 30) {
+  const interleaved = [];
+  while (sourceQueues.some((items) => items.length) && interleaved.length < 30) {
     for (const queue of sourceQueues) {
       const next = queue.shift();
-      if (next) data.push(next);
-      if (data.length >= 30) break;
+      if (next) interleaved.push(next);
+      if (interleaved.length >= 30) break;
     }
   }
 
+  const data = interleaved.map(({ filterContext, ...item }) => item);
   cache.set(cacheKey, { time: Date.now(), data });
   return data;
 }
@@ -1273,10 +1292,12 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (url.pathname === '/api/config') {
+      // The payload depends on MAPBOX_TOKEN — must revalidate so token changes
+      // reach clients immediately after a redeploy.
       sendJson(req, res, {
         mapProvider: MAPBOX_TOKEN ? 'mapbox' : 'fallback',
         mapboxToken: MAPBOX_TOKEN
-      }, 200, 'public, max-age=3600');
+      });
       return;
     }
 
