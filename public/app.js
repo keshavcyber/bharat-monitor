@@ -318,7 +318,7 @@ function tickerItemHtml(item, index, total, updated) {
 
 function renderTicker(data) {
   lastTickerData = data;
-  const updated = formatTime(data.updatedAt);
+  const updated = `${data.stale ? 'Delayed · ' : ''}${formatTime(data.updatedAt)}`;
   const itemsHtml = data.items
     .map((item, index) => tickerItemHtml(item, index, data.items.length, updated))
     .join('');

@@ -897,21 +897,52 @@ function marketOpenStatus() {
   };
 }
 
+// Yahoo often blocks generic user agents and is slower to answer from cloud
+// hosts (e.g. Render), so the ticker uses a browser UA, a longer timeout, and
+// one retry. A shared cloud IP can also be rate-limited intermittently, which
+// is handled by stale-while-error caching in liveMetrics().
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const TICKER_FETCH_TIMEOUT_MS = 12000;
+let lastGoodTicker = null;
+
 async function fetchYahooSummary(symbol) {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d`;
-  const response = await fetch(url, {
-    headers: { 'User-Agent': 'BharatMonitor/0.1 (+local dev)' },
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await fetch(url, {
+        headers: { 'User-Agent': BROWSER_UA, Accept: 'application/json' },
+        signal: AbortSignal.timeout(TICKER_FETCH_TIMEOUT_MS)
+      });
+      if (!response.ok) throw new Error(`Yahoo chart ${symbol} failed: HTTP ${response.status}`);
+      const json = await response.json();
+      const result = json?.chart?.result?.[0];
+      const closes = result?.indicators?.quote?.[0]?.close?.filter((value) => Number.isFinite(value)) || [];
+      const current = closes.at(-1);
+      const previous = closes.at(-2) ?? current;
+      const currency = result?.meta?.currency || '';
+      const percent = previous ? ((current - previous) / previous) * 100 : 0;
+      if (!Number.isFinite(current)) throw new Error(`Yahoo chart ${symbol}: no close values`);
+      return { symbol, current, previous, percent, currency };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
+// Keyless, cloud-friendly forex fallback for USD/INR when Yahoo is unavailable.
+async function fetchUsdInrFallback() {
+  const response = await fetch('https://open.er-api.com/v6/latest/USD', {
+    headers: { 'User-Agent': BROWSER_UA },
+    signal: AbortSignal.timeout(TICKER_FETCH_TIMEOUT_MS)
   });
-  if (!response.ok) throw new Error(`Yahoo chart ${symbol} failed: HTTP ${response.status}`);
+  if (!response.ok) throw new Error(`Forex fallback failed: HTTP ${response.status}`);
   const json = await response.json();
-  const result = json?.chart?.result?.[0];
-  const closes = result?.indicators?.quote?.[0]?.close?.filter((value) => Number.isFinite(value)) || [];
-  const current = closes.at(-1);
-  const previous = closes.at(-2) ?? current;
-  const currency = result?.meta?.currency || '';
-  const percent = previous ? ((current - previous) / previous) * 100 : 0;
-  return { symbol, current, previous, percent, currency };
+  const inr = json?.rates?.INR;
+  if (!Number.isFinite(inr)) throw new Error('Forex fallback: no INR rate');
+  // Daily-change isn't available from this source, so percent stays null.
+  return { symbol: 'INR=X', current: inr, previous: inr, percent: null, currency: 'INR' };
 }
 
 async function liveMetrics() {
@@ -921,7 +952,7 @@ async function liveMetrics() {
 
   // One failed symbol should degrade to "--" for that metric, not take down the strip.
   const empty = (symbol) => ({ symbol, current: null, previous: null, percent: null, currency: '' });
-  const [nifty, sensex, usdInr, goldFutures, brent] = (await Promise.allSettled([
+  let [nifty, sensex, usdInr, goldFutures, brent] = (await Promise.allSettled([
     fetchYahooSummary('^NSEI'),
     fetchYahooSummary('^BSESN'),
     fetchYahooSummary('INR=X'),
@@ -930,6 +961,12 @@ async function liveMetrics() {
   ])).map((result, index) =>
     result.status === 'fulfilled' ? result.value : empty(['^NSEI', '^BSESN', 'INR=X', 'GC=F', 'BZ=F'][index])
   );
+
+  // If Yahoo's rupee quote failed, try the keyless forex source so USD/INR and
+  // the derived gold price still resolve.
+  if (!Number.isFinite(usdInr.current)) {
+    try { usdInr = await fetchUsdInrFallback(); } catch { /* keep the empty placeholder */ }
+  }
 
   const usdPerInr = usdInr.current ? 1 / usdInr.current : null;
   const gold24kPer10g = goldFutures.current && usdPerInr
@@ -979,10 +1016,22 @@ async function liveMetrics() {
 
   const data = {
     updatedAt: new Date().toISOString(),
-    items
+    items,
+    stale: false
   };
 
-  cache.set(cacheKey, { time: Date.now(), data });
+  // Only trust and cache a payload that actually has market values; a burst of
+  // failures should not overwrite good data with a strip full of "--".
+  const hasRealData = [nifty, sensex, usdInr, goldFutures, brent].some((quote) => Number.isFinite(quote.current));
+  if (hasRealData) {
+    lastGoodTicker = data;
+    cache.set(cacheKey, { time: Date.now(), data });
+    return data;
+  }
+
+  // Everything failed this round. Serve the last good values (marked stale) if
+  // we have them, and don't cache the failure so the next request retries soon.
+  if (lastGoodTicker) return { ...lastGoodTicker, stale: true };
   return data;
 }
 
