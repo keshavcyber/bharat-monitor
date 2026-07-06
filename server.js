@@ -1,7 +1,9 @@
 ﻿import http from 'node:http';
-import { readFile } from 'node:fs/promises';
-import { extname, join, normalize } from 'node:path';
+import { readFile, stat } from 'node:fs/promises';
+import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gzipSync, brotliCompressSync, constants as zlibConstants } from 'node:zlib';
+import { createHash } from 'node:crypto';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const publicDir = join(__dirname, 'public');
@@ -10,11 +12,37 @@ const cache = new Map();
 const CACHE_MS = 10 * 60 * 1000;
 const LIVE_METRICS_CACHE_MS = 3 * 60 * 1000;
 const MAPBOX_TOKEN = process.env.MAPBOX_TOKEN || '';
+const FETCH_TIMEOUT_MS = 8000;
 
 const BOUNDARY_URL = 'https://raw.githubusercontent.com/Subhash9325/GeoJson-Data-of-Indian-States/master/Indian_States';
 let boundaryCache = null;
 let boundaryCacheTime = 0;
 const BOUNDARY_CACHE_MS = 24 * 60 * 60 * 1000;
+
+function etagFor(buffer) {
+  return `"${createHash('sha1').update(buffer).digest('base64url').slice(0, 20)}"`;
+}
+
+function pickEncoding(req, byteLength) {
+  if (byteLength < 1024) return null;
+  const accepted = String(req.headers['accept-encoding'] || '');
+  if (/\bbr\b/.test(accepted)) return 'br';
+  if (/\bgzip\b/.test(accepted)) return 'gzip';
+  return null;
+}
+
+function compressBody(body, encoding, { quality = 5 } = {}) {
+  if (encoding === 'br') {
+    return brotliCompressSync(body, {
+      params: {
+        [zlibConstants.BROTLI_PARAM_QUALITY]: quality,
+        [zlibConstants.BROTLI_PARAM_SIZE_HINT]: body.length
+      }
+    });
+  }
+  if (encoding === 'gzip') return gzipSync(body, { level: 6 });
+  return body;
+}
 
 function slugName(value = '') {
   return value
@@ -41,33 +69,114 @@ function resolveBoundaryId(name) {
   return boundaryNameAliases.get(slug) || slug;
 }
 
+// The map is capped at zoom 7.2 (~1 km per pixel), so geometry detail below
+// ~200 m can never be seen. Douglas-Peucker with a ~0.002° tolerance keeps the
+// outlines pixel-identical while dropping the vast majority of vertices.
+const SIMPLIFY_TOLERANCE_DEG = 0.002;
+
+function perpendicularDistance(point, lineStart, lineEnd) {
+  const dx = lineEnd[0] - lineStart[0];
+  const dy = lineEnd[1] - lineStart[1];
+  const lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared === 0) return Math.hypot(point[0] - lineStart[0], point[1] - lineStart[1]);
+  const t = ((point[0] - lineStart[0]) * dx + (point[1] - lineStart[1]) * dy) / lengthSquared;
+  const clamped = Math.max(0, Math.min(1, t));
+  return Math.hypot(point[0] - (lineStart[0] + clamped * dx), point[1] - (lineStart[1] + clamped * dy));
+}
+
+function douglasPeucker(points, tolerance) {
+  if (points.length <= 2) return points;
+  let maxDistance = 0;
+  let maxIndex = 0;
+  const last = points.length - 1;
+  for (let i = 1; i < last; i++) {
+    const distance = perpendicularDistance(points[i], points[0], points[last]);
+    if (distance > maxDistance) {
+      maxDistance = distance;
+      maxIndex = i;
+    }
+  }
+  if (maxDistance <= tolerance) return [points[0], points[last]];
+  const left = douglasPeucker(points.slice(0, maxIndex + 1), tolerance);
+  const right = douglasPeucker(points.slice(maxIndex), tolerance);
+  return left.slice(0, -1).concat(right);
+}
+
+function simplifyRing(ring, tolerance) {
+  const simplified = douglasPeucker(ring, tolerance);
+  // A valid GeoJSON ring needs at least 4 positions with a closing point.
+  return simplified.length >= 4 ? simplified : ring;
+}
+
+function roundCoordinate(pair) {
+  return [Math.round(pair[0] * 1e4) / 1e4, Math.round(pair[1] * 1e4) / 1e4];
+}
+
+function simplifyGeometry(geometry) {
+  const simplifyPolygon = (rings) => rings.map((ring) => simplifyRing(ring, SIMPLIFY_TOLERANCE_DEG).map(roundCoordinate));
+  if (geometry.type === 'Polygon') {
+    return { type: 'Polygon', coordinates: simplifyPolygon(geometry.coordinates) };
+  }
+  if (geometry.type === 'MultiPolygon') {
+    return { type: 'MultiPolygon', coordinates: geometry.coordinates.map(simplifyPolygon) };
+  }
+  return geometry;
+}
+
+let boundaryInflight = null;
+
 async function loadBoundaries() {
   if (boundaryCache && Date.now() - boundaryCacheTime < BOUNDARY_CACHE_MS) return boundaryCache;
+  if (boundaryInflight) return boundaryInflight;
+  boundaryInflight = fetchBoundaries().finally(() => { boundaryInflight = null; });
+  return boundaryInflight;
+}
 
-  const response = await fetch(BOUNDARY_URL, {
-    headers: { 'User-Agent': 'BharatMonitor/0.1 (+local dev)' }
-  });
-  if (!response.ok) throw new Error(`Boundary fetch failed: HTTP ${response.status}`);
+async function fetchBoundaries() {
+  try {
+    const response = await fetch(BOUNDARY_URL, {
+      headers: { 'User-Agent': 'BharatMonitor/0.1 (+local dev)' },
+      signal: AbortSignal.timeout(30_000)
+    });
+    if (!response.ok) throw new Error(`Boundary fetch failed: HTTP ${response.status}`);
 
-  const geojson = await response.json();
-  geojson.features = (geojson.features || []).map((feature) => {
-    const sourceName = feature.properties?.NAME_1 || feature.properties?.ST_NM || feature.properties?.name || 'Unknown';
-    const id = resolveBoundaryId(sourceName);
-    const known = states.find((state) => state.id === id);
-    return {
-      ...feature,
-      properties: {
-        ...feature.properties,
-        id,
-        name: known?.name || sourceName,
-        region: known?.region || 'India'
-      }
+    const geojson = await response.json();
+    // Simplify geometry to the resolution the map can actually display and keep
+    // only the properties the client reads — cuts the payload from ~11 MB to a
+    // fraction with no visible change at state-level zoom.
+    const features = (geojson.features || []).map((feature) => {
+      const sourceName = feature.properties?.NAME_1 || feature.properties?.ST_NM || feature.properties?.name || 'Unknown';
+      const id = resolveBoundaryId(sourceName);
+      const known = states.find((state) => state.id === id);
+      return {
+        type: 'Feature',
+        properties: {
+          id,
+          name: known?.name || sourceName,
+          region: known?.region || 'India'
+        },
+        geometry: simplifyGeometry(feature.geometry)
+      };
+    });
+
+    const body = Buffer.from(JSON.stringify({ type: 'FeatureCollection', features }));
+    boundaryCache = {
+      body,
+      etag: etagFor(body),
+      // Compressed once per day, so spend more effort for a smaller wire size.
+      encoded: { br: compressBody(body, 'br', { quality: 9 }), gzip: compressBody(body, 'gzip') }
     };
-  });
-
-  boundaryCache = geojson;
-  boundaryCacheTime = Date.now();
-  return boundaryCache;
+    boundaryCacheTime = Date.now();
+    return boundaryCache;
+  } catch (error) {
+    // Serve the previous payload rather than failing the map when GitHub is
+    // unreachable, and back off retries for five minutes.
+    if (boundaryCache) {
+      boundaryCacheTime = Date.now() - BOUNDARY_CACHE_MS + 5 * 60 * 1000;
+      return boundaryCache;
+    }
+    throw error;
+  }
 }
 
 const states = [
@@ -791,7 +900,8 @@ function marketOpenStatus() {
 async function fetchYahooSummary(symbol) {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d`;
   const response = await fetch(url, {
-    headers: { 'User-Agent': 'BharatMonitor/0.1 (+local dev)' }
+    headers: { 'User-Agent': 'BharatMonitor/0.1 (+local dev)' },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
   });
   if (!response.ok) throw new Error(`Yahoo chart ${symbol} failed: HTTP ${response.status}`);
   const json = await response.json();
@@ -809,18 +919,24 @@ async function liveMetrics() {
   const cached = cache.get(cacheKey);
   if (cached && Date.now() - cached.time < LIVE_METRICS_CACHE_MS) return cached.data;
 
-  const [nifty, sensex, usdInr, goldFutures, brent] = await Promise.all([
+  // One failed symbol should degrade to "--" for that metric, not take down the strip.
+  const empty = (symbol) => ({ symbol, current: null, previous: null, percent: null, currency: '' });
+  const [nifty, sensex, usdInr, goldFutures, brent] = (await Promise.allSettled([
     fetchYahooSummary('^NSEI'),
     fetchYahooSummary('^BSESN'),
     fetchYahooSummary('INR=X'),
     fetchYahooSummary('GC=F'),
     fetchYahooSummary('BZ=F')
-  ]);
+  ])).map((result, index) =>
+    result.status === 'fulfilled' ? result.value : empty(['^NSEI', '^BSESN', 'INR=X', 'GC=F', 'BZ=F'][index])
+  );
 
   const usdPerInr = usdInr.current ? 1 / usdInr.current : null;
   const gold24kPer10g = goldFutures.current && usdPerInr
     ? (goldFutures.current / 31.1034768) * 10 / usdPerInr
     : null;
+
+  const trendFor = (percent) => (Number.isFinite(percent) ? (percent >= 0 ? 'up' : 'down') : 'flat');
 
   const items = [
     marketOpenStatus(),
@@ -828,35 +944,35 @@ async function liveMetrics() {
       label: 'Nifty 50',
       value: formatTickerNumber(nifty.current, 2),
       delta: nifty.percent,
-      trend: nifty.percent >= 0 ? 'up' : 'down',
+      trend: trendFor(nifty.percent),
       source: 'Yahoo Finance'
     },
     {
       label: 'Sensex',
       value: formatTickerNumber(sensex.current, 2),
       delta: sensex.percent,
-      trend: sensex.percent >= 0 ? 'up' : 'down',
+      trend: trendFor(sensex.percent),
       source: 'Yahoo Finance'
     },
     {
       label: 'USD/INR',
       value: usdInr.current ? `${formatTickerNumber(usdInr.current, 2)}` : '--',
       delta: usdInr.percent,
-      trend: usdInr.percent >= 0 ? 'up' : 'down',
+      trend: trendFor(usdInr.percent),
       source: 'Yahoo Finance'
     },
     {
       label: 'Gold (24K)',
       value: gold24kPer10g ? `₹${formatTickerNumber(gold24kPer10g, 0)}/10g` : '--',
       delta: goldFutures.percent,
-      trend: goldFutures.percent >= 0 ? 'up' : 'down',
+      trend: trendFor(goldFutures.percent),
       source: 'Derived from GC=F + USD/INR'
     },
     {
       label: 'Brent Crude',
       value: brent.current ? `$${formatTickerNumber(brent.current, 2)}/bbl` : '--',
       delta: brent.percent,
-      trend: brent.percent >= 0 ? 'up' : 'down',
+      trend: trendFor(brent.percent),
       source: 'Yahoo Finance'
     }
   ];
@@ -884,17 +1000,21 @@ function feedsFor(category, stateId) {
   return profile.queries(`${state.name} India`).map((query) => googleNewsUrl(query, profile.days));
 }
 
+const namedEntities = {
+  amp: '&', quot: '"', apos: "'", lt: '<', gt: '>', nbsp: ' ',
+  mdash: '—', ndash: '–', hellip: '…', rsquo: '’', lsquo: '‘',
+  rdquo: '”', ldquo: '“', deg: '°', middot: '·', laquo: '«', raquo: '»'
+};
+
 function decodeEntities(value = '') {
   return value
     .replaceAll('<![CDATA[', '')
     .replaceAll(']]>', '')
-    .replaceAll('&amp;', '&')
-    .replaceAll('&quot;', '"')
-    .replaceAll('&#39;', "'")
-    .replaceAll('&apos;', "'")
-    .replaceAll('&lt;', '<')
-    .replaceAll('&gt;', '>')
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(Number.parseInt(code, 16)))
+    .replace(/&([a-z]+);/gi, (match, name) => namedEntities[name.toLowerCase()] ?? match)
     .replace(/<[^>]+>/g, '')
+    .replace(/\s+/g, ' ')
     .trim();
 }
 
@@ -903,16 +1023,74 @@ function tag(xml, name) {
   return decodeEntities(match?.[1] || '');
 }
 
+// Channel <title> values in RSS are long SEO strings; show a clean brand name instead.
+const sourceBrands = new Map([
+  ['thehindu.com', 'The Hindu'],
+  ['indianexpress.com', 'The Indian Express'],
+  ['ndtv.com', 'NDTV'],
+  ['feedburner.com', 'NDTV'],
+  ['news18.com', 'News18'],
+  ['hindustantimes.com', 'Hindustan Times'],
+  ['news.google.com', 'Google News'],
+  ['moneycontrol.com', 'Moneycontrol'],
+  ['economictimes.indiatimes.com', 'Economic Times'],
+  ['livemint.com', 'Mint'],
+  ['business-standard.com', 'Business Standard'],
+  ['inc42.com', 'Inc42'],
+  ['medianama.com', 'MediaNama'],
+  ['yourstory.com', 'YourStory'],
+  ['firstpost.com', 'Firstpost'],
+  ['pib.gov.in', 'PIB']
+]);
+
+function sourceBrandFor(sourceUrl, channelTitle) {
+  const hostname = new URL(sourceUrl).hostname.replace(/^www\./, '');
+  if (sourceBrands.has(hostname)) return sourceBrands.get(hostname);
+  const bare = hostname.split('.').slice(-2).join('.');
+  if (sourceBrands.has(bare)) return sourceBrands.get(bare);
+  if (channelTitle && channelTitle.length <= 40) return channelTitle;
+  return hostname;
+}
+
+function safeLink(link = '') {
+  return /^https?:\/\//i.test(link) ? link : '';
+}
+
+function normalizedText(value = '') {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
 function parseRss(xml, sourceUrl) {
-  const source = tag(xml, 'title') || new URL(sourceUrl).hostname;
+  const channelTitle = tag(xml.slice(0, 4000), 'title');
+  const fallbackSource = sourceBrandFor(sourceUrl, channelTitle);
+  const isGoogleNews = new URL(sourceUrl).hostname === 'news.google.com';
   const blocks = xml.match(/<item[\s\S]*?<\/item>/gi) || [];
-  return blocks.map((block) => ({
-    title: tag(block, 'title'),
-    link: tag(block, 'link'),
-    source,
-    publishedAt: tag(block, 'pubDate') || tag(block, 'updated'),
-    summary: tag(block, 'description')
-  })).filter((item) => item.title && item.link);
+
+  return blocks.map((block) => {
+    let title = tag(block, 'title');
+    let source = fallbackSource;
+    let summary = tag(block, 'description');
+
+    // Google News item titles end with " - Publisher"; surface the real publisher.
+    if (isGoogleNews) {
+      const split = title.match(/^(.*)\s-\s([^-]{2,40})$/);
+      if (split) {
+        title = split[1].trim();
+        source = split[2].trim();
+      }
+    }
+
+    // Drop summaries that merely repeat the headline (common in Google News feeds).
+    if (summary && normalizedText(summary).startsWith(normalizedText(title))) summary = '';
+
+    return {
+      title,
+      link: safeLink(tag(block, 'link')),
+      source,
+      publishedAt: tag(block, 'pubDate') || tag(block, 'updated'),
+      summary
+    };
+  }).filter((item) => item.title && item.link);
 }
 
 async function loadCategory(category, stateId) {
@@ -922,25 +1100,28 @@ async function loadCategory(category, stateId) {
   const cached = cache.get(cacheKey);
   if (cached && Date.now() - cached.time < CACHE_MS) return cached.data;
 
-  const results = [];
-  for (const feedUrl of feedsFor(key, selectedState?.id)) {
+  // Fetch every feed concurrently with a timeout — a slow publisher should not
+  // hold the whole category hostage.
+  const feedResults = await Promise.all(feedsFor(key, selectedState?.id).map(async (feedUrl) => {
     try {
       const response = await fetch(feedUrl, {
-        headers: { 'User-Agent': 'BharatMonitor/0.1 (+local dev)' }
+        headers: { 'User-Agent': 'BharatMonitor/0.1 (+local dev)' },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const xml = await response.text();
-      results.push(...parseRss(xml, feedUrl));
+      return parseRss(xml, feedUrl);
     } catch (error) {
-      results.push({
+      return [{
         title: `Could not load ${new URL(feedUrl).hostname}`,
         link: feedUrl,
         source: 'Fetch error',
         publishedAt: new Date().toISOString(),
         summary: error.message
-      });
+      }];
     }
-  }
+  }));
+  const results = feedResults.flat();
 
   const profile = categoryProfiles[key] || categoryProfiles.top;
   const seen = new Set();
@@ -989,32 +1170,100 @@ async function loadCategory(category, stateId) {
   return data;
 }
 
-function sendJson(res, data, status = 200) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
-  res.end(JSON.stringify(data));
+function sendBody(req, res, body, { status = 200, contentType, cacheControl = 'no-cache', etag } = {}) {
+  const headers = {
+    'Content-Type': contentType,
+    'Cache-Control': cacheControl,
+    'X-Content-Type-Options': 'nosniff',
+    Vary: 'Accept-Encoding'
+  };
+  if (etag) {
+    headers.ETag = etag;
+    if (req.headers['if-none-match'] === etag) {
+      res.writeHead(304, headers);
+      res.end();
+      return;
+    }
+  }
+
+  const encoding = pickEncoding(req, body.length);
+  const payload = encoding ? compressBody(body, encoding) : body;
+  if (encoding) headers['Content-Encoding'] = encoding;
+  headers['Content-Length'] = payload.length;
+  res.writeHead(status, headers);
+  res.end(req.method === 'HEAD' ? undefined : payload);
 }
 
-async function serveStatic(pathname, res) {
+function sendJson(req, res, data, status = 200, cacheControl = 'no-cache') {
+  sendBody(req, res, Buffer.from(JSON.stringify(data)), {
+    status,
+    contentType: 'application/json; charset=utf-8',
+    cacheControl
+  });
+}
+
+// Pre-encoded payloads (boundaries) skip per-request compression entirely.
+function sendPrepared(req, res, prepared, cacheControl) {
+  const headers = {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': cacheControl,
+    'X-Content-Type-Options': 'nosniff',
+    Vary: 'Accept-Encoding',
+    ETag: prepared.etag
+  };
+  if (req.headers['if-none-match'] === prepared.etag) {
+    res.writeHead(304, headers);
+    res.end();
+    return;
+  }
+  const encoding = pickEncoding(req, prepared.body.length);
+  const payload = encoding ? prepared.encoded[encoding] : prepared.body;
+  if (encoding) headers['Content-Encoding'] = encoding;
+  headers['Content-Length'] = payload.length;
+  res.writeHead(200, headers);
+  res.end(req.method === 'HEAD' ? undefined : payload);
+}
+
+const staticTypes = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.webmanifest': 'application/manifest+json',
+  '.woff2': 'font/woff2',
+  '.map': 'application/json'
+};
+
+const staticCache = new Map();
+
+async function serveStatic(req, pathname, res) {
   const safePath = normalize(pathname === '/' ? '/index.html' : pathname).replace(/^([/\\])+/, '');
   const filePath = join(publicDir, safePath);
-  if (!filePath.startsWith(publicDir)) {
+  if (filePath !== publicDir && !filePath.startsWith(publicDir + sep)) {
     res.writeHead(403);
     res.end('Forbidden');
     return;
   }
 
-  const types = {
-    '.html': 'text/html; charset=utf-8',
-    '.css': 'text/css; charset=utf-8',
-    '.js': 'text/javascript; charset=utf-8'
-  };
-
   try {
-    const body = await readFile(filePath);
-    res.writeHead(200, { 'Content-Type': types[extname(filePath)] || 'application/octet-stream' });
-    res.end(body);
+    // Cache file contents in memory, revalidated by mtime so local edits still show up.
+    const { mtimeMs, size } = await stat(filePath);
+    let entry = staticCache.get(filePath);
+    if (!entry || entry.mtimeMs !== mtimeMs || entry.size !== size) {
+      const body = await readFile(filePath);
+      entry = { body, mtimeMs, size, etag: etagFor(body) };
+      staticCache.set(filePath, entry);
+    }
+    sendBody(req, res, entry.body, {
+      contentType: staticTypes[extname(filePath)] || 'application/octet-stream',
+      cacheControl: 'no-cache',
+      etag: entry.etag
+    });
   } catch {
-    res.writeHead(404);
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Not found');
   }
 }
@@ -1022,77 +1271,90 @@ async function serveStatic(pathname, res) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
-  if (url.pathname === '/api/config') {
-    sendJson(res, {
-      mapProvider: MAPBOX_TOKEN ? 'mapbox' : 'fallback',
-      mapboxToken: MAPBOX_TOKEN
-    });
-    return;
-  }
-
-  if (url.pathname === '/api/categories') {
-    sendJson(res, Object.entries(labels).map(([id, label]) => ({ id, label })));
-    return;
-  }
-
-  if (url.pathname === '/api/states') {
-    sendJson(res, states);
-    return;
-  }
-
-  if (url.pathname === '/api/metrics') {
-    sendJson(res, metricsFor(url.searchParams.get('state') || ''));
-    return;
-  }
-
-  if (url.pathname === '/api/state-profile') {
-    sendJson(res, {
-      updatedAt: new Date().toISOString(),
-      item: stateProfileFor(url.searchParams.get('state') || '')
-    });
-    return;
-  }
-
-  if (url.pathname === '/api/score') {
-    sendJson(res, scoreFor(url.searchParams.get('state') || ''));
-    return;
-  }
-
-  if (url.pathname === '/api/live-metrics') {
-    try {
-      sendJson(res, await liveMetrics());
-    } catch (error) {
-      sendJson(res, { error: error.message }, 502);
+  try {
+    if (url.pathname === '/api/config') {
+      sendJson(req, res, {
+        mapProvider: MAPBOX_TOKEN ? 'mapbox' : 'fallback',
+        mapboxToken: MAPBOX_TOKEN
+      }, 200, 'public, max-age=3600');
+      return;
     }
-    return;
-  }
 
-  if (url.pathname === '/api/boundaries') {
-    try {
-      sendJson(res, await loadBoundaries());
-    } catch (error) {
-      sendJson(res, { error: error.message }, 502);
+    if (url.pathname === '/api/categories') {
+      sendJson(req, res, Object.entries(labels).map(([id, label]) => ({ id, label })), 200, 'public, max-age=3600');
+      return;
     }
-    return;
-  }
-  if (url.pathname === '/api/news') {
-    const category = url.searchParams.get('category') || 'top';
-    const stateId = url.searchParams.get('state') || '';
-    const selectedState = stateById(stateId);
-    const items = await loadCategory(category, selectedState?.id);
-    const baseLabel = labels[category] || labels.top;
-    const label = selectedState ? `${baseLabel} in ${selectedState.name}` : baseLabel;
-    sendJson(res, {
-      category,
-      state: selectedState || null,
-      label,
-      updatedAt: new Date().toISOString(),
-      items
-    });
-    return;
-  }
 
-  await serveStatic(url.pathname, res);
+    if (url.pathname === '/api/states') {
+      sendJson(req, res, states, 200, 'public, max-age=3600');
+      return;
+    }
+
+    if (url.pathname === '/api/metrics') {
+      sendJson(req, res, metricsFor(url.searchParams.get('state') || ''));
+      return;
+    }
+
+    if (url.pathname === '/api/state-profile') {
+      sendJson(req, res, {
+        updatedAt: new Date().toISOString(),
+        item: stateProfileFor(url.searchParams.get('state') || '')
+      });
+      return;
+    }
+
+    if (url.pathname === '/api/score') {
+      sendJson(req, res, scoreFor(url.searchParams.get('state') || ''));
+      return;
+    }
+
+    if (url.pathname === '/api/live-metrics') {
+      try {
+        sendJson(req, res, await liveMetrics());
+      } catch (error) {
+        sendJson(req, res, { error: error.message }, 502);
+      }
+      return;
+    }
+
+    if (url.pathname === '/api/boundaries') {
+      try {
+        const prepared = await loadBoundaries();
+        sendPrepared(req, res, prepared, 'public, max-age=86400, stale-while-revalidate=604800');
+      } catch (error) {
+        sendJson(req, res, { error: error.message }, 502);
+      }
+      return;
+    }
+
+    if (url.pathname === '/api/news') {
+      const category = url.searchParams.get('category') || 'top';
+      const stateId = url.searchParams.get('state') || '';
+      const selectedState = stateById(stateId);
+      const items = await loadCategory(category, selectedState?.id);
+      const baseLabel = labels[category] || labels.top;
+      const label = selectedState ? `${baseLabel} in ${selectedState.name}` : baseLabel;
+      sendJson(req, res, {
+        category,
+        state: selectedState || null,
+        label,
+        updatedAt: new Date().toISOString(),
+        items
+      });
+      return;
+    }
+
+    if (url.pathname.startsWith('/api/')) {
+      sendJson(req, res, { error: 'Not found' }, 404);
+      return;
+    }
+
+    await serveStatic(req, url.pathname, res);
+  } catch (error) {
+    console.error(`Request failed: ${req.method} ${url.pathname}`, error);
+    if (!res.headersSent) sendJson(req, res, { error: 'Internal server error' }, 500);
+    else res.end();
+  }
 });
 
 server.on('error', (error) => {
