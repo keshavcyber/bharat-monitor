@@ -1189,6 +1189,181 @@ async function loadCategory(category, stateId) {
   return data;
 }
 
+/* --------------------------------------------------------------------------
+   Live map event layers
+   Turns the India map into a live event board: earthquakes (USGS, keyless),
+   news hotspots (reuses the cached top feed), and disaster/weather alerts
+   (reuses the cached alert feeds). Each layer is a GeoJSON FeatureCollection
+   the client drops straight onto Mapbox.
+   -------------------------------------------------------------------------- */
+
+const MAP_EVENTS_CACHE_MS = 5 * 60 * 1000;
+const INDIA_EVENT_BBOX = { minLat: 6, maxLat: 38, minLng: 66, maxLng: 98 };
+// Longest names first so "Andhra Pradesh" wins over a stray "Andaman" substring.
+const statesByNameLength = [...states].sort((a, b) => b.name.length - a.name.length);
+
+function featureCollection(features) {
+  return { type: 'FeatureCollection', features };
+}
+
+function firstStateInText(text = '') {
+  const haystack = text.toLowerCase();
+  return statesByNameLength.find((state) => haystack.includes(state.name.toLowerCase())) || null;
+}
+
+function magnitudeSeverity(mag) {
+  if (mag >= 5) return 'high';
+  if (mag >= 4) return 'medium';
+  return 'low';
+}
+
+async function loadEarthquakes(days) {
+  const startTime = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const params = new URLSearchParams({
+    format: 'geojson',
+    starttime: startTime,
+    minlatitude: String(INDIA_EVENT_BBOX.minLat),
+    maxlatitude: String(INDIA_EVENT_BBOX.maxLat),
+    minlongitude: String(INDIA_EVENT_BBOX.minLng),
+    maxlongitude: String(INDIA_EVENT_BBOX.maxLng),
+    minmagnitude: '2.5',
+    orderby: 'time'
+  });
+  const response = await fetch(`https://earthquake.usgs.gov/fdsnws/event/1/query?${params.toString()}`, {
+    headers: { 'User-Agent': 'BharatMonitor/0.1 (+local dev)' },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+  });
+  if (!response.ok) throw new Error(`USGS quakes failed: HTTP ${response.status}`);
+  const json = await response.json();
+  const features = (json.features || [])
+    .filter((feature) => Array.isArray(feature.geometry?.coordinates))
+    .map((feature) => {
+      const [lng, lat, depth] = feature.geometry.coordinates;
+      const mag = Number(feature.properties?.mag);
+      return {
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [lng, lat] },
+        properties: {
+          layer: 'quakes',
+          title: `M ${Number.isFinite(mag) ? mag.toFixed(1) : '?'} · ${feature.properties?.place || 'Unknown location'}`,
+          magnitude: Number.isFinite(mag) ? mag : null,
+          depthKm: Number.isFinite(depth) ? Math.round(depth) : null,
+          severity: magnitudeSeverity(mag),
+          weight: Number.isFinite(mag) ? mag : 2.5,
+          time: feature.properties?.time ? new Date(feature.properties.time).toISOString() : null,
+          url: feature.properties?.url || ''
+        }
+      };
+    });
+  return featureCollection(features);
+}
+
+async function loadNewsHotspots() {
+  // Aggregate state mentions across several national feeds so the heat map has
+  // real density; all of these are already cached by the news panel.
+  const feeds = await Promise.all(
+    ['top', 'government', 'markets'].map((category) => loadCategory(category).catch(() => []))
+  );
+  const items = feeds.flat();
+  const counts = new Map();
+  const seen = new Set();
+  for (const item of items) {
+    if (seen.has(item.title)) continue;
+    seen.add(item.title);
+    const haystack = `${item.title} ${item.summary}`.toLowerCase();
+    for (const state of states) {
+      if (haystack.includes(state.name.toLowerCase())) {
+        counts.set(state.id, (counts.get(state.id) || 0) + 1);
+      }
+    }
+  }
+  const features = [...counts.entries()].map(([id, count]) => {
+    const state = stateById(id);
+    return {
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [state.lng, state.lat] },
+      properties: {
+        layer: 'hotspots',
+        title: `${state.name} · ${count} ${count === 1 ? 'story' : 'stories'}`,
+        state: state.name,
+        stateId: id,
+        count,
+        weight: count,
+        severity: count >= 4 ? 'high' : count >= 2 ? 'medium' : 'low'
+      }
+    };
+  });
+  return featureCollection(features);
+}
+
+async function loadAlertEvents() {
+  const [disasters, weather] = await Promise.all([
+    loadCategory('disasters'),
+    loadCategory('weather')
+  ]);
+
+  // Group every alert onto the state it names, one marker per state, so
+  // multiple alerts don't stack invisibly on the same centroid.
+  const byState = new Map();
+  const add = (item, kind) => {
+    const state = firstStateInText(`${item.title} ${item.summary}`);
+    if (!state) return;
+    const entry = byState.get(state.id) || { state, disaster: 0, weather: 0, items: [] };
+    entry[kind] += 1;
+    if (entry.items.length < 6) {
+      entry.items.push({ title: item.title, source: item.source, url: item.link, time: item.publishedAt, kind });
+    }
+    byState.set(state.id, entry);
+  };
+  disasters.forEach((item) => add(item, 'disaster'));
+  weather.forEach((item) => add(item, 'weather'));
+
+  const features = [...byState.values()].map((entry) => {
+    const total = entry.disaster + entry.weather;
+    return {
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [entry.state.lng, entry.state.lat] },
+      properties: {
+        layer: 'alerts',
+        title: `${entry.state.name} · ${total} ${total === 1 ? 'alert' : 'alerts'}`,
+        state: entry.state.name,
+        stateId: entry.state.id,
+        count: total,
+        weight: total,
+        severity: entry.disaster > 0 ? 'high' : 'medium',
+        itemsJson: JSON.stringify(entry.items)
+      }
+    };
+  });
+  return featureCollection(features);
+}
+
+async function loadMapEvents(days) {
+  const cacheKey = `map-events:${days}`;
+  const cached = cache.get(cacheKey);
+  if (cached && Date.now() - cached.time < MAP_EVENTS_CACHE_MS) return cached.data;
+
+  const empty = featureCollection([]);
+  const [quakes, hotspots, alerts] = await Promise.all([
+    loadEarthquakes(days).catch((error) => { console.error('quakes layer failed', error.message); return empty; }),
+    loadNewsHotspots().catch((error) => { console.error('hotspots layer failed', error.message); return empty; }),
+    loadAlertEvents().catch((error) => { console.error('alerts layer failed', error.message); return empty; })
+  ]);
+
+  const data = {
+    updatedAt: new Date().toISOString(),
+    days,
+    layers: [
+      { id: 'quakes', label: 'Earthquakes', color: '#ff6b6b', description: 'USGS seismic events (M2.5+) in and around India.', data: quakes, count: quakes.features.length },
+      { id: 'hotspots', label: 'News hotspots', color: '#f59e0b', description: 'States by national news mentions right now.', data: hotspots, count: hotspots.features.length },
+      { id: 'alerts', label: 'Disaster & weather', color: '#60a5fa', description: 'States with active disaster or weather alerts.', data: alerts, count: alerts.features.length }
+    ]
+  };
+
+  cache.set(cacheKey, { time: Date.now(), data });
+  return data;
+}
+
 function sendBody(req, res, body, { status = 200, contentType, cacheControl = 'no-cache', etag } = {}) {
   const headers = {
     'Content-Type': contentType,
@@ -1342,6 +1517,17 @@ const server = http.createServer(async (req, res) => {
       try {
         const prepared = await loadBoundaries();
         sendPrepared(req, res, prepared, 'public, max-age=86400, stale-while-revalidate=604800');
+      } catch (error) {
+        sendJson(req, res, { error: error.message }, 502);
+      }
+      return;
+    }
+
+    if (url.pathname === '/api/map-events') {
+      const requested = Number(url.searchParams.get('days'));
+      const days = [1, 7, 30].includes(requested) ? requested : 7;
+      try {
+        sendJson(req, res, await loadMapEvents(days), 200, 'public, max-age=300');
       } catch (error) {
         sendJson(req, res, { error: error.message }, 502);
       }

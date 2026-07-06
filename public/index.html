@@ -59,8 +59,23 @@
           <div id="heroTabs" class="tabs horizontal-tabs" role="tablist" aria-label="Hero feed categories"></div>
           <div id="heroNewsList" class="news-list compact-list" role="tabpanel" aria-busy="false"></div>
         </aside>
-        <div id="map" class="map-card" role="region" aria-label="Map of India with clickable states. Use the state selector in the header as a keyboard alternative."></div>
-        <div id="mapNotice" class="map-notice" role="status" hidden>Mapbox could not load. Check your connection.</div>
+        <div class="map-shell">
+          <div id="map" class="map-card" role="region" aria-label="Map of India with clickable states. Use the state selector in the header as a keyboard alternative."></div>
+
+          <div class="map-controls" aria-label="Live map layers">
+            <div class="map-controls-head">
+              <span class="map-controls-title">Live layers</span>
+              <div id="timeRange" class="time-range" role="group" aria-label="Event time range">
+                <button type="button" data-days="1" aria-pressed="false">24h</button>
+                <button type="button" data-days="7" aria-pressed="true">7d</button>
+                <button type="button" data-days="30" aria-pressed="false">30d</button>
+              </div>
+            </div>
+            <div id="layerToggles" class="layer-toggles"></div>
+          </div>
+
+          <div id="mapNotice" class="map-notice" role="status" hidden>Mapbox could not load. Check your connection.</div>
+        </div>
       </section>
 
       <section id="stateProfileSection" class="dashboard-section state-profile-section">

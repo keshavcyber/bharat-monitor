@@ -41,6 +41,8 @@ const scoreUpdatedAtEl = document.querySelector('#scoreUpdatedAt');
 const scoreGridEl = document.querySelector('#scoreGrid');
 const mapNotice = document.querySelector('#mapNotice');
 const a11yStatusEl = document.querySelector('#a11yStatus');
+const layerTogglesEl = document.querySelector('#layerToggles');
+const timeRangeEl = document.querySelector('#timeRange');
 
 const INDIA_BOUNDS = [[66.8, 6.0], [98.0, 37.8]];
 const INDIA_CAMERA_BOUNDS = [[66.0, 4.8], [99.3, 38.8]];
@@ -48,6 +50,9 @@ const INDIA_RESET_PADDING = { top: 58, right: 72, bottom: 74, left: 72 };
 const INDIA_RESET_MAX_ZOOM = 2.35;
 const BLANK_INDIA_STYLE = {
   version: 8,
+  // Glyphs endpoint so the state-name and capital symbol layers can render text.
+  // Uses the Mapbox-hosted fonts (available once an access token is set).
+  glyphs: 'mapbox://fonts/mapbox/{fontstack}/{range}.pbf',
   sources: {},
   layers: [
     { id: 'background', type: 'background', paint: { 'background-color': '#05090d' } }
@@ -105,6 +110,14 @@ let boundaryLayersAdded = false;
 let hoveredStateId = '';
 let lastTickerData = null;
 let scoreAnimationFrame = 0;
+
+// Live map event layers
+let mapEvents = null;
+let eventDays = 7;
+let activeLayers = null;      // Set of visible layer ids; null until first load
+let eventLayersAdded = false;
+const addedEventLayerIds = [];
+let eventPopup = null;
 
 const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
 const hoverCapable = window.matchMedia('(hover: hover)');
@@ -774,6 +787,9 @@ function addBoundaryLayers() {
   });
 
   map.on('click', 'state-fill', (event) => {
+    // A click on an event marker sitting over a state should open that marker's
+    // popup, not select the state underneath it.
+    if (eventFeatureAt(event.point)) return;
     const feature = event.features?.[0];
     if (!feature) return;
     const capital = CAPITALS[feature.properties.id];
@@ -807,10 +823,12 @@ function addBoundaryLayers() {
 }
 
 function tryAddBoundaryLayers() {
-  if (!map || !mapReady || boundaryLayersAdded) return;
-  if (!boundaries?.features?.length) return;
-  addBoundaryLayers();
-  boundaryLayersAdded = true;
+  if (map && mapReady && !boundaryLayersAdded && boundaries?.features?.length) {
+    addBoundaryLayers();
+    boundaryLayersAdded = true;
+  }
+  // Event layers sit on top of the boundaries, so (re)try them here too.
+  ensureEventLayers();
 }
 
 function showMapNotice(message) {
@@ -872,6 +890,186 @@ function buildMap(boundariesPromise) {
 }
 
 /* --------------------------------------------------------------------------
+   Live map event layers
+   -------------------------------------------------------------------------- */
+
+// Marker radius scales with each layer's "weight" (quake magnitude, or story /
+// alert count) so bigger events read as bigger dots.
+const LAYER_RADIUS = {
+  quakes: ['interpolate', ['linear'], ['get', 'weight'], 2.5, 4, 5, 12, 7, 22],
+  hotspots: ['interpolate', ['linear'], ['get', 'weight'], 1, 6, 5, 14, 12, 22],
+  alerts: ['interpolate', ['linear'], ['get', 'weight'], 1, 7, 5, 15, 12, 22]
+};
+
+const eventSourceId = (id) => `event-src-${id}`;
+const eventLayerId = (id) => `event-layer-${id}`;
+
+function readUrlState() {
+  const params = new URLSearchParams(location.search);
+  const days = Number(params.get('days'));
+  if ([1, 7, 30].includes(days)) eventDays = days;
+  const layers = params.get('layers');
+  if (layers !== null) {
+    activeLayers = new Set(layers.split(',').map((value) => value.trim()).filter(Boolean));
+  }
+}
+
+function syncUrlState() {
+  if (!mapEvents || !activeLayers) return;
+  const params = new URLSearchParams(location.search);
+  params.set('days', String(eventDays));
+  params.set('layers', [...activeLayers].join(','));
+  history.replaceState(null, '', `${location.pathname}?${params.toString()}`);
+}
+
+function buildLayerControls() {
+  if (!mapEvents || !activeLayers) return;
+  layerTogglesEl.innerHTML = mapEvents.layers.map((layer) => {
+    const on = activeLayers.has(layer.id);
+    return `
+      <button class="layer-toggle" type="button" role="switch" data-layer="${escapeHtml(layer.id)}"
+        aria-checked="${on}" aria-pressed="${on}" style="--dot:${escapeHtml(layer.color)}"
+        title="${escapeHtml(layer.description || '')}">
+        <span class="layer-dot" aria-hidden="true"></span>
+        <span class="layer-name">${escapeHtml(layer.label)}</span>
+        <span class="layer-count">${Number(layer.count) || 0}</span>
+      </button>
+    `;
+  }).join('');
+
+  layerTogglesEl.querySelectorAll('.layer-toggle').forEach((button) => {
+    button.addEventListener('click', () => toggleLayer(button.dataset.layer));
+  });
+}
+
+function toggleLayer(id) {
+  if (!activeLayers) return;
+  const on = !activeLayers.has(id);
+  if (on) activeLayers.add(id); else activeLayers.delete(id);
+  const button = layerTogglesEl.querySelector(`[data-layer="${CSS.escape(id)}"]`);
+  if (button) {
+    button.setAttribute('aria-checked', String(on));
+    button.setAttribute('aria-pressed', String(on));
+  }
+  setLayerVisibility(id, on);
+  syncUrlState();
+  const layer = mapEvents?.layers.find((item) => item.id === id);
+  announce(`${layer?.label || id} layer ${on ? 'shown' : 'hidden'}.`);
+}
+
+function setLayerVisibility(id, visible) {
+  if (!map || !eventLayersAdded) return;
+  const layerId = eventLayerId(id);
+  if (map.getLayer(layerId)) {
+    map.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none');
+  }
+}
+
+function eventFeatureAt(point) {
+  if (!map || !eventLayersAdded) return false;
+  const layers = addedEventLayerIds.filter((id) => map.getLayer(id));
+  return layers.length ? map.queryRenderedFeatures(point, { layers }).length > 0 : false;
+}
+
+function addEventLayers() {
+  for (const layer of mapEvents.layers) {
+    map.addSource(eventSourceId(layer.id), { type: 'geojson', data: layer.data });
+    map.addLayer({
+      id: eventLayerId(layer.id),
+      type: 'circle',
+      source: eventSourceId(layer.id),
+      layout: { visibility: activeLayers.has(layer.id) ? 'visible' : 'none' },
+      paint: {
+        'circle-radius': LAYER_RADIUS[layer.id] || 8,
+        'circle-color': layer.color,
+        'circle-opacity': 0.66,
+        'circle-blur': 0.15,
+        'circle-stroke-width': 1.4,
+        'circle-stroke-color': 'rgba(5,7,10,0.85)'
+      }
+    });
+    addedEventLayerIds.push(eventLayerId(layer.id));
+    map.on('click', eventLayerId(layer.id), (event) => showEventPopup(event, layer));
+    map.on('mouseenter', eventLayerId(layer.id), () => { map.getCanvas().style.cursor = 'pointer'; });
+    map.on('mouseleave', eventLayerId(layer.id), () => { map.getCanvas().style.cursor = ''; });
+  }
+  eventLayersAdded = true;
+}
+
+function updateEventLayers() {
+  for (const layer of mapEvents.layers) {
+    const source = map.getSource(eventSourceId(layer.id));
+    if (source) source.setData(layer.data);
+    setLayerVisibility(layer.id, activeLayers.has(layer.id));
+  }
+}
+
+function ensureEventLayers() {
+  if (!map || !mapReady || !boundaryLayersAdded || !mapEvents || !activeLayers) return;
+  if (eventLayersAdded) updateEventLayers();
+  else addEventLayers();
+}
+
+function showEventPopup(event, layer) {
+  const feature = event.features?.[0];
+  if (!feature) return;
+  const props = feature.properties;
+  const severity = ['high', 'medium', 'low'].includes(props.severity) ? props.severity : 'low';
+  let body = '';
+
+  if (layer.id === 'quakes') {
+    const detail = [];
+    if (props.time) detail.push(relativeTime(props.time));
+    const depth = Number(props.depthKm);
+    if (Number.isFinite(depth)) detail.push(`${depth} km deep`);
+    const mag = Number(props.magnitude);
+    body = `
+      <span class="event-popup-badge ${severity}">Magnitude ${Number.isFinite(mag) ? mag.toFixed(1) : '?'}</span>
+      <strong>${escapeHtml(props.title)}</strong>
+      ${detail.length ? `<span>${escapeHtml(detail.join(' · '))}</span>` : ''}
+      ${props.url ? `<a class="popup-action" href="${escapeHtml(safeHref(props.url))}" target="_blank" rel="noopener">View on USGS →</a>` : ''}
+    `;
+  } else if (layer.id === 'hotspots') {
+    body = `
+      <span class="event-popup-badge ${severity}">News hotspot</span>
+      <strong>${escapeHtml(props.title)}</strong>
+      <button class="popup-action" type="button" data-select-state="${escapeHtml(props.stateId)}">See ${escapeHtml(props.state)} news →</button>
+    `;
+  } else if (layer.id === 'alerts') {
+    let items = [];
+    try { items = JSON.parse(props.itemsJson || '[]'); } catch { items = []; }
+    const list = items.slice(0, 4).map((item) => `<li>${escapeHtml(item.title)}</li>`).join('');
+    const count = Number(props.count) || 0;
+    body = `
+      <span class="event-popup-badge ${severity}">${count} alert${count === 1 ? '' : 's'}</span>
+      <strong>${escapeHtml(props.title)}</strong>
+      ${list ? `<ul>${list}</ul>` : ''}
+      <button class="popup-action" type="button" data-select-state="${escapeHtml(props.stateId)}">See ${escapeHtml(props.state)} feed →</button>
+    `;
+  }
+
+  eventPopup?.remove();
+  eventPopup = new window.mapboxgl.Popup({ closeButton: true, offset: 12, maxWidth: '280px' })
+    .setLngLat(event.lngLat)
+    .setHTML(`<div class="map-popup event-popup">${body}</div>`)
+    .addTo(map);
+}
+
+async function loadMapEventsData(days = eventDays) {
+  try {
+    const data = await fetchJson(`/api/map-events?days=${days}`);
+    if (data.error) throw new Error(data.error);
+    mapEvents = data;
+    if (!activeLayers) activeLayers = new Set(data.layers.map((layer) => layer.id));
+    buildLayerControls();
+    ensureEventLayers();
+    syncUrlState();
+  } catch {
+    layerTogglesEl.innerHTML = '<p style="color:var(--muted);font-size:12px;margin:0;">Live layers unavailable.</p>';
+  }
+}
+
+/* --------------------------------------------------------------------------
    Refresh
    -------------------------------------------------------------------------- */
 
@@ -904,6 +1102,9 @@ async function refreshAll() {
    -------------------------------------------------------------------------- */
 
 async function init() {
+  readUrlState();
+  syncTimeRangeButtons();
+
   // Boundaries are the heaviest payload — fetch them in parallel and let the
   // rest of the dashboard render without waiting.
   const boundariesPromise = fetchJson('/api/boundaries')
@@ -924,7 +1125,19 @@ async function init() {
   syncTabs();
   populateStateSelect();
   buildMap(boundariesPromise);
-  await Promise.all([loadHeroFeed('top'), loadStateProfile(''), loadScore(''), loadLiveMetrics()]);
+  await Promise.all([
+    loadHeroFeed('top'),
+    loadStateProfile(''),
+    loadScore(''),
+    loadLiveMetrics(),
+    loadMapEventsData(eventDays)
+  ]);
+}
+
+function syncTimeRangeButtons() {
+  timeRangeEl?.querySelectorAll('button').forEach((button) => {
+    button.setAttribute('aria-pressed', String(Number(button.dataset.days) === eventDays));
+  });
 }
 
 refreshBtn.addEventListener('click', refreshAll);
@@ -938,6 +1151,26 @@ stateSelectEl.addEventListener('change', () => {
     return;
   }
   selectState(value);
+});
+
+timeRangeEl?.addEventListener('click', (event) => {
+  const button = event.target.closest('button[data-days]');
+  if (!button) return;
+  const days = Number(button.dataset.days);
+  if (days === eventDays) return;
+  eventDays = days;
+  syncTimeRangeButtons();
+  syncUrlState();
+  loadMapEventsData(days);
+});
+
+// Popup "See <state> news/feed" actions drill into that state.
+document.addEventListener('click', (event) => {
+  const action = event.target.closest('[data-select-state]');
+  if (!action) return;
+  const stateId = action.dataset.selectState;
+  eventPopup?.remove();
+  if (stateById(stateId)) selectState(stateId);
 });
 
 scoreInfoButtonEl.addEventListener('click', (event) => {
