@@ -111,9 +111,10 @@ let hoveredStateId = '';
 let lastTickerData = null;
 let scoreAnimationFrame = 0;
 
-// Live map event layers
+// Live map event layers. Default to 30 days so the earthquake layer — India
+// has low in-border seismicity — isn't empty on load.
 let mapEvents = null;
-let eventDays = 7;
+let eventDays = 30;
 let activeLayers = null;      // Set of visible layer ids; null until first load
 let eventLayersAdded = false;
 const addedEventLayerIds = [];
