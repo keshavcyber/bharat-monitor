@@ -123,6 +123,47 @@ function simplifyGeometry(geometry) {
   return geometry;
 }
 
+// India is not a rectangle, so a bounding box can't separate its events from
+// those of neighbouring countries. These polygons (built from the boundary
+// GeoJSON) drive an exact point-in-country test for the earthquake layer.
+let indiaPolygons = [];
+
+function buildIndiaHitTest(features) {
+  const polygons = [];
+  for (const feature of features) {
+    const geometry = feature.geometry;
+    if (!geometry) continue;
+    if (geometry.type === 'Polygon') polygons.push(geometry.coordinates);
+    else if (geometry.type === 'MultiPolygon') geometry.coordinates.forEach((poly) => polygons.push(poly));
+  }
+  indiaPolygons = polygons;
+}
+
+function pointInRing(lng, lat, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0];
+    const yi = ring[i][1];
+    const xj = ring[j][0];
+    const yj = ring[j][1];
+    const intersects = ((yi > lat) !== (yj > lat)) && (lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi);
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+function pointInIndia(lng, lat) {
+  for (const polygon of indiaPolygons) {
+    if (!pointInRing(lng, lat, polygon[0])) continue;
+    let inHole = false;
+    for (let k = 1; k < polygon.length; k++) {
+      if (pointInRing(lng, lat, polygon[k])) { inHole = true; break; }
+    }
+    if (!inHole) return true;
+  }
+  return false;
+}
+
 let boundaryInflight = null;
 
 async function loadBoundaries() {
@@ -158,6 +199,8 @@ async function fetchBoundaries() {
         geometry: simplifyGeometry(feature.geometry)
       };
     });
+
+    buildIndiaHitTest(features);
 
     const body = Buffer.from(JSON.stringify({ type: 'FeatureCollection', features }));
     boundaryCache = {
@@ -1267,6 +1310,10 @@ function magnitudeSeverity(mag) {
 }
 
 async function loadEarthquakes(days) {
+  // Load India's polygons so we can keep only quakes actually inside the
+  // country (the USGS bbox also covers China, Pakistan, Afghanistan, etc.).
+  try { await loadBoundaries(); } catch { /* fall back to the place-name test below */ }
+
   const startTime = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
   const params = new URLSearchParams({
     format: 'geojson',
@@ -1284,8 +1331,16 @@ async function loadEarthquakes(days) {
   });
   if (!response.ok) throw new Error(`USGS quakes failed: HTTP ${response.status}`);
   const json = await response.json();
+  const insideIndia = (lng, lat, place) => (
+    indiaPolygons.length ? pointInIndia(lng, lat) : /india/i.test(place || '')
+  );
   const features = (json.features || [])
     .filter((feature) => Array.isArray(feature.geometry?.coordinates))
+    .filter((feature) => insideIndia(
+      feature.geometry.coordinates[0],
+      feature.geometry.coordinates[1],
+      feature.properties?.place
+    ))
     .map((feature) => {
       const [lng, lat, depth] = feature.geometry.coordinates;
       const mag = Number(feature.properties?.mag);
@@ -1403,7 +1458,7 @@ async function loadMapEvents(days) {
     updatedAt: new Date().toISOString(),
     days,
     layers: [
-      { id: 'quakes', label: 'Earthquakes', color: '#ff6b6b', description: 'USGS seismic events (M2.5+) in and around India.', data: quakes, count: quakes.features.length },
+      { id: 'quakes', label: 'Earthquakes', color: '#ff6b6b', description: 'USGS seismic events (M2.5+) within India.', data: quakes, count: quakes.features.length },
       { id: 'hotspots', label: 'News hotspots', color: '#f59e0b', description: 'States by national news mentions right now.', data: hotspots, count: hotspots.features.length },
       { id: 'alerts', label: 'Disaster & weather', color: '#60a5fa', description: 'States with active disaster or weather alerts.', data: alerts, count: alerts.features.length }
     ]
